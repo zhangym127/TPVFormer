@@ -162,6 +162,9 @@ class TPVFormerLayer(BaseModule):
         norm_index = 0
         attn_index = 0
         ffn_index = 0
+
+        # 如果是交叉注意力机制，将查询沿第1维度num_query连接起来
+        # query的形状是[bs, num_query, embed_dims]
         if self.operation_order[0] == 'cross_attn':
             query = torch.cat(query, dim=1)
         identity = query
@@ -169,15 +172,22 @@ class TPVFormerLayer(BaseModule):
         for layer in self.operation_order:
             # cross view hybrid attention
             if layer == 'self_attn':
+
+                # 下面针对交叉视图混合注意力机制构造专门的spatial_shapes和level_start_index
+                # 三层的spatial_shapes分别为[tpv_h, tpv_w], [tpv_z, tpv_h], [tpv_w, tpv_z]
+                # num_levels=3指代三视图的三个平面，而不是特征图的三个层级
                 ss = torch.tensor([
                     [tpv_h, tpv_w],
                     [tpv_z, tpv_h],
                     [tpv_w, tpv_z]
                 ], device=query[0].device)
+                # level_start_index指代三个平面的起始索引，即[0, tpv_h*tpv_w, tpv_h*tpv_w+tpv_z*tpv_h]
                 lsi = torch.tensor([
                     0, tpv_h*tpv_w, tpv_h*tpv_w+tpv_z*tpv_h
                 ], device=query[0].device)
 
+                # 把query拆分成三个平面对应的query，返回的query是一个list
+                # 以便于交叉视图混合注意力对每个query进行映射和连接
                 if not isinstance(query, (list, tuple)):
                     query = torch.split(
                         query, [tpv_h*tpv_w, tpv_z*tpv_h, tpv_w*tpv_z], dim=1)
@@ -186,9 +196,9 @@ class TPVFormerLayer(BaseModule):
                     query,
                     identity if self.pre_norm else None,
                     query_pos=tpv_pos,
-                    reference_points=ref_2d,
-                    spatial_shapes=ss,
-                    level_start_index=lsi,
+                    reference_points=ref_2d, # 九组参考点按照视图分成三个层级
+                    spatial_shapes=ss,       # 使用专门的spatial_shapes，分成三个层级
+                    level_start_index=lsi,   # 使用专门的level_start_index，分成三个层级
                     **kwargs)
                 attn_index += 1
                 query = torch.cat(query, dim=1)
@@ -201,14 +211,14 @@ class TPVFormerLayer(BaseModule):
             # image cross attention
             elif layer == 'cross_attn':
                 query = self.attentions[attn_index](
-                    query,
-                    key,
-                    value,
+                    query,  # 将三个视图query沿num_query维度连接起来的合并query
+                    key,    # 多尺度特征图，格式是(num_cam, H*W++, bs, embed_dims)
+                    value,  # 多尺度特征图，格式是(num_cam, H*W++, bs, embed_dims)
                     identity if self.pre_norm else None,
-                    spatial_shapes=spatial_shapes,
-                    level_start_index=level_start_index,
-                    reference_points_cams=reference_points_cams,
-                    tpv_masks=tpv_masks,
+                    spatial_shapes=spatial_shapes,          # 特征图的尺寸，形状为[L,2]，分别记录每一层的H和W
+                    level_start_index=level_start_index,    # 每一层特征图的起始索引
+                    reference_points_cams=reference_points_cams,    # list类型，为三视图分别生成的三组3D参考点，投影到图像后的像素坐标
+                    tpv_masks=tpv_masks,                    # list类型，为三视图分别生成的三组mask，标记有效的参考点，形状是（N,B,H*W,D）
                     **kwargs)
                 attn_index += 1
                 identity = query

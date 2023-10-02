@@ -29,8 +29,8 @@ class TPVCrossViewHybridAttention(BaseModule):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_heads = num_heads
-        self.num_levels = 3
-        self.num_points = num_points
+        self.num_levels = 3             # 表示TPV的三个平面，而不是特征图的三个层级
+        self.num_points = num_points    # 表示每个参考点的采样点数量
         self.num_anchors = num_anchors
         self.init_mode = init_mode
         self.dropout = nn.ModuleList([
@@ -110,16 +110,22 @@ class TPVCrossViewHybridAttention(BaseModule):
             self.attention_weights[i].bias.data = attn_bias.flatten()
             xavier_init(self.value_proj[i], distribution='uniform', bias=0.)
             xavier_init(self.output_proj[i], distribution='uniform', bias=0.)    
-        
+    
+    # 以query为输入，通过全连接网络映射为采样偏移量和注意力权重
     def get_sampling_offsets_and_attention(self, queries):
         offsets = []
         attns = []
         for i, (query, fc, attn) in enumerate(zip(queries, self.sampling_offsets, self.attention_weights)):
             bs, l, d = query.shape
 
+            # fc是采样偏移的全连接网络，以query为输入，输出的形状是[bs, l, num_heads, num_levels, num_points, 2]
+            # l表示每个平面的查询数量，对于hw平面，l=tpv_h*tpv_w，对于zh平面，l=tpv_z*tpv_h，对于wz平面，l=tpv_w*tpv_z
+            # num_levels=3表示TPV的三个平面，而不是特征图的三个层级
+            # num_points表示每个参考点的总采样点数量
             offset = fc(query).reshape(bs, l, self.num_heads, self.num_levels, self.num_points, 2)
             offsets.append(offset)
 
+            # attn是注意力权重的全连接网络，以query为输入，输出形状是[bs, l, H, 3, 4+1]
             attention = attn(query).reshape(bs, l, self.num_heads, 3, -1)
             level_attention = attention[:, :, :, :, -1:].softmax(-2) # bs, l, H, 3, 1
             attention = attention[:, :, :, :, :-1]
@@ -127,6 +133,7 @@ class TPVCrossViewHybridAttention(BaseModule):
             attention = attention * level_attention
             attns.append(attention)
         
+        # 将三个平面的采样偏移量和注意力权重沿第1维度连接起来，形状是[bs, l, num_heads, num_levels, num_points, 2]和[bs, l, H, 3, p]
         offsets = torch.cat(offsets, dim=1)
         attns = torch.cat(attns, dim=1)
         return offsets, attns
@@ -148,16 +155,31 @@ class TPVCrossViewHybridAttention(BaseModule):
         if query_pos is not None:
             query = [q + p for q, p in zip(query, query_pos)]
 
+        # 通过对query进行全连接映射，获得三个视图对应的value，连接成一个张量，并分配到多个检测头
         # value proj
         query_lens = [q.shape[1] for q in query]
+        # 分别对三个查询进行全连接映射，获得三个视图对应的value，形状是[bs, num_query, embed_dims]
         value = [layer(q) for layer, q in zip(self.value_proj, query)]
+        # 将三个视图的value沿第1维度连接起来，形状是[bs, num_query, embed_dims]
         value = torch.cat(value, dim=1)
         bs, num_value, _ = value.shape
+        # 将value的embed_dims维度分配到多个检测头，形状变成[bs, num_query, num_heads, embed_dims/num_heads]
         value = value.view(bs, num_value, self.num_heads, -1)
 
+        # 以query为输入，通过全连接网络映射为采样偏移量和注意力权重
+        # 其中sampling_offsets的形状从上下文来看是[bs, num_query, num_heads, num_levels, num_all_points, xy]
+        # 其中num_all_points == num_points * num_Z_anchors
+        # FIXME: 但是从get_sampling_offsets_and_attention的实现来看，num_all_points似乎等于num_points
         # sampling offsets and weights
         sampling_offsets, attention_weights = self.get_sampling_offsets_and_attention(query)
 
+        # reference_points的形状是[bs, hw+zh+wz, 3, p, 2]
+        # 其中hw+zh+wz就是num_query
+        # 其中3就是num_levels，表示TPV的三个平面，而不是特征图的三个层级
+        # 其中p=32就是num_Z_anchors
+        # 其中2就是xy
+
+        # 确认参考点的最后一个维度是2
         if reference_points.shape[-1] == 2:
             """
             For each tpv query, it owns `num_Z_anchors` in 3D space that having different heights.
@@ -165,20 +187,33 @@ class TPVCrossViewHybridAttention(BaseModule):
             For each referent point, we sample `num_points` sampling points.
             For `num_Z_anchors` reference points,  it has overall `num_points * num_Z_anchors` sampling points.
             """
+
+            # 对于每个 tpv 查询，它在 3D 空间中拥有 num_Z_anchors 个不同高度的锚点。
+            # 在投影之后，每个 tpv 查询在每个 2D 图像中有 num_Z_anchors 个参考点。
+            # 对于每个参考点，我们采样 num_points 个采样点。
+            # 对于 num_Z_anchors 个参考点来说，总共有 num_points * num_Z_anchors 个采样点。
+
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
 
+            # reference_points的形状是[bs, hw+zh+wz, 3, p, 2]，其中p=32就是num_Z_anchors
             bs, num_query, _, num_Z_anchors, xy = reference_points.shape
+            # 给参考点扩展两个维度，分别是num_heads和num_points，形状变成：
+            # [bs, hw+zh+wz, num_heads, 3, num_Z_anchors, num_points, 2]
             reference_points = reference_points[:, :, None, :, :, None, :]
+            # 对采样偏移量进行归一化
             sampling_offsets = sampling_offsets / \
                 offset_normalizer[None, None, None, :, None, :]
+            # 下面的num_all_points = num_points * num_Z_anchors
             bs, num_query, num_heads, num_levels, num_all_points, xy = sampling_offsets.shape
             sampling_offsets = sampling_offsets.view(
                 bs, num_query, num_heads, num_levels, num_Z_anchors, num_all_points // num_Z_anchors, xy)
             sampling_locations = reference_points + sampling_offsets
+            # 下面的代码似乎把num_points和num_Z_anchors弄反了，不过没关系，后续也不会再用到它们
             bs, num_query, num_heads, num_levels, num_points, num_Z_anchors, xy = sampling_locations.shape
             assert num_all_points == num_points * num_Z_anchors
 
+            # 把采样位置的num_points和num_Z_anchors维度合并，形状变成[bs, num_query, num_heads, num_levels, num_all_points, 2]
             sampling_locations = sampling_locations.view(
                 bs, num_query, num_heads, num_levels, num_all_points, xy)
         else:

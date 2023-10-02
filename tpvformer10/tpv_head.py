@@ -100,11 +100,14 @@ class TPVFormerHead(BaseModule):
             bs, num_cam, c, h, w = feat.shape
             spatial_shape = (h, w)
             feat = feat.flatten(3).permute(1, 0, 3, 2) # num_cam, bs, hw, c
+            # 将相机嵌入扩展为[N,1,1,embed_dims]的形状后添加到特征图中
             feat = feat + self.cams_embeds[:, None, None, :].to(dtype)
+            # 将层级嵌入添加到特征图中
             feat = feat + self.level_embeds[None, None, lvl:lvl+1, :].to(dtype)
             spatial_shapes.append(spatial_shape)
             feat_flatten.append(feat)
 
+        # 把不同层级（尺度）的特征图沿hw维度连接起来，形状变成[N,bs,H*W++,C]
         feat_flatten = torch.cat(feat_flatten, 2) # num_cam, bs, hw++, c
         spatial_shapes = torch.as_tensor(
             spatial_shapes, dtype=torch.long, device=device)
@@ -113,13 +116,13 @@ class TPVFormerHead(BaseModule):
         feat_flatten = feat_flatten.permute(0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
         tpv_embed = self.encoder(
             [tpv_queries_hw, tpv_queries_zh, tpv_queries_wz],
-            feat_flatten,
-            feat_flatten,
+            feat_flatten,  # (num_cam, H*W++, bs, embed_dims)
+            feat_flatten,  # (num_cam, H*W++, bs, embed_dims)
             tpv_h=self.tpv_h,
             tpv_w=self.tpv_w,
             tpv_z=self.tpv_z,
             tpv_pos=tpv_pos,
-            spatial_shapes=spatial_shapes,
+            spatial_shapes=spatial_shapes,  # 特征图的尺寸，形状为[L,2]，分别记录每一层的H和W
             level_start_index=level_start_index,
             img_metas=img_metas,
         )
